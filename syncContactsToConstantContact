@@ -1,0 +1,440 @@
+const CC_BASE = 'https://api.cc.email/v3';
+const CC_TOKEN = 'https://authz.constantcontact.com/oauth2/default/v1/token';
+
+
+const SHEET_NAME = 'Master (All Tabs)';
+const TARGET_LIST_NAME = 'DIV6 Google Sheets Leads';
+const NOTIFY_EMAIL = 'cschilli98@gmail.com';
+
+
+const COLS = {
+  first: 'First Name',
+  last: 'Last Name',
+  email: 'Email',
+  phone: 'Phone',
+  topTag: 'Top-Level Tag',
+  subTag: 'Sub-Category Tag',
+  channel: 'Channel',
+  eventDate: 'Event Date',
+  notes: 'Notes'
+};
+
+
+// --- speed/robustness knobs ---
+const TIME_BUDGET_MS = 5 * 60 * 1000;    // ~5 minutes, leave ~60s to wrap up
+const PER_CONTACT_DELAY_MS = 120;         // 80–150ms helps avoid 429s
+const PROP_CURSOR_KEY = 'CC_SYNC_CURSOR'; // resume index across runs
+
+
+function syncMasterAllTabsToConstantContact() {
+  const errors = [];
+  const metrics = { totalRows: 0, processed: 0, skippedNoEmail: 0, tagBatches: 0 };
+
+
+  const startTs = Date.now();
+  let cursor = Number(PropertiesService.getScriptProperties().getProperty(PROP_CURSOR_KEY) || 0);
+
+
+  try {
+    // Ensure token works before we start
+    ensureAccessToken_();
+
+
+    const listId = getOrCacheListId_(TARGET_LIST_NAME);
+    const { rows, headerMap } = readSheet_(SHEET_NAME);
+    metrics.totalRows = rows.length;
+
+
+    if (cursor >= rows.length) cursor = 0; // safety reset
+
+
+    const contacts = [];
+    const allTagNames = new Set();
+
+
+    // Build this-run slice (from cursor), with time guard + logs
+    for (let idx = cursor; idx < rows.length; idx++) {
+      if (Date.now() - startTs > (TIME_BUDGET_MS - 60000)) {
+        PropertiesService.getScriptProperties().setProperty(PROP_CURSOR_KEY, String(idx));
+        Logger.log(`Time budget reached. Saved cursor at global row index ${idx}.`);
+        break;
+      }
+
+
+      if (idx > cursor && (idx - cursor) % 50 === 0) {
+        Logger.log(`Processed ${idx - cursor} rows this run (global ${idx}/${rows.length}).`);
+      }
+
+
+      const r = rows[idx];
+
+
+      const email = val_(r, headerMap[COLS.email]);
+      if (!email) { metrics.skippedNoEmail++; continue; }
+
+
+      const firstNameRaw = val_(r, headerMap[COLS.first]);
+      const lastNameRaw  = val_(r, headerMap[COLS.last]);
+      const phone        = val_(r, headerMap[COLS.phone]);
+
+
+      const t1 = val_(r, headerMap[COLS.topTag]);
+      const t2 = val_(r, headerMap[COLS.subTag]);
+      const tagNames = splitTags_([t1, t2]);
+      tagNames.forEach(n => allTagNames.add(n));
+
+
+      contacts.push({
+        rowNumber: idx + 2,
+        email,
+        firstName: firstNameRaw,
+        lastName:  lastNameRaw,
+        phone,
+        tagNames
+      });
+    }
+
+
+    if (!contacts.length) {
+      if (cursor === 0) throw new Error('No contacts with Email found on sheet.');
+      // Hit time guard before picking any rows (rare) — exit; next run resumes.
+      return;
+    }
+
+
+    const tagIdMap = ensureTagsAndMapIds_(Array.from(allTagNames));
+
+
+    const groups = {};            // key = JSON.stringify(tagIds), value = [contact_ids...]
+    const retry = new Backoff_(); // light backoff on 429
+
+
+    // Upsert contacts and collect ids for tagging
+    contacts.forEach(c => {
+      // --- Name cleaning: remove emails/junk; omit if invalid after cleaning
+      const firstClean = cleanNameOrNull_(c.firstName);
+      const lastClean  = cleanNameOrNull_(c.lastName);
+
+
+      const payload = {
+        email_address: c.email,
+        first_name: firstClean || undefined,
+        last_name:  lastClean  || undefined,
+        phone_number: c.phone || undefined,
+        list_memberships: [listId]
+      };
+
+
+      try {
+        const res = ccFetch_('/contacts/sign_up_form', 'post', payload);
+        const contactId = (res && res.contact_id) ? res.contact_id : null;
+        if (!contactId) throw new Error('Missing contact_id in response');
+
+
+        metrics.processed++;
+
+
+        const tagIds = (c.tagNames || []).map(n => tagIdMap[n]).filter(Boolean).sort();
+        if (tagIds.length) {
+          const key = JSON.stringify(tagIds);
+          if (!groups[key]) groups[key] = [];
+          groups[key].push(contactId);
+        }
+      } catch (e) {
+        errors.push(`Row ${c.rowNumber} (${c.email}): ${stringifyErr_(e)}`);
+        retry.maybeWait(e);
+      } finally {
+        Utilities.sleep(PER_CONTACT_DELAY_MS);
+      }
+    });
+
+
+    // Bulk-apply tags per tag-set (batches of 500)
+    Object.entries(groups).forEach(([key, ids]) => {
+      const tagIds = JSON.parse(key);
+      for (let i = 0; i < ids.length; i += 500) {
+        const batch = ids.slice(i, i + 500);
+        const body = { source: { contact_ids: batch }, tag_ids: tagIds };
+        try {
+          ccFetch_('/activities/contacts_taggings_add', 'post', body);
+          metrics.tagBatches++;
+        } catch (e) {
+          errors.push(`Tagging contacts [${batch.length}] with tags ${tagIds.join(', ')} failed: ${stringifyErr_(e)}`);
+        }
+      }
+    });
+
+
+    // Advance or clear cursor
+    const newCursor = Number(PropertiesService.getScriptProperties().getProperty(PROP_CURSOR_KEY) || cursor) + contacts.length;
+    if (newCursor >= metrics.totalRows) {
+      PropertiesService.getScriptProperties().deleteProperty(PROP_CURSOR_KEY);
+    } else {
+      PropertiesService.getScriptProperties().setProperty(PROP_CURSOR_KEY, String(newCursor));
+    }
+
+
+    // 🔔 Email outcome
+    if (errors.length) {
+      MailApp.sendEmail({
+        to: NOTIFY_EMAIL,
+        subject: 'Constant Contact Sync – Completed with Errors',
+        htmlBody:
+          `<p>Some rows failed during sync (${errors.length}).</p>
+           <ul>
+             <li>Total rows seen: <b>${metrics.totalRows}</b></li>
+             <li>Processed this run: <b>${metrics.processed}</b></li>
+             <li>Skipped (no email): <b>${metrics.skippedNoEmail}</b></li>
+             <li>Bulk tag add requests: <b>${metrics.tagBatches}</b></li>
+             <li>Cursor: <b>${(newCursor >= metrics.totalRows) ? 'done' : newCursor}</b></li>
+           </ul>
+           <pre>${escapeHtml_(errors.join('\n'))}</pre>`
+      });
+    } else {
+      MailApp.sendEmail({
+        to: NOTIFY_EMAIL,
+        subject: 'Constant Contact Sync – SUCCESS',
+        htmlBody:
+          `<p>Sync slice completed successfully.</p>
+           <ul>
+             <li>Total rows seen: <b>${metrics.totalRows}</b></li>
+             <li>Processed this run: <b>${metrics.processed}</b></li>
+             <li>Skipped (no email): <b>${metrics.skippedNoEmail}</b></li>
+             <li>Bulk tag add requests: <b>${metrics.tagBatches}</b></li>
+             <li>Cursor: <b>${(newCursor >= metrics.totalRows) ? 'done' : newCursor}</b></li>
+           </ul>`
+      });
+    }
+  } catch (topErr) {
+    MailApp.sendEmail({
+      to: NOTIFY_EMAIL,
+      subject: 'Constant Contact Sync – FAILED',
+      htmlBody: `<p>The sync did not complete.</p><pre>${escapeHtml_(stringifyErr_(topErr))}</pre>`
+    });
+    throw topErr;
+  }
+}
+
+
+/** ---------- Auth ---------- **/
+function ensureAccessToken_() {
+  const props = PropertiesService.getScriptProperties();
+  let at = props.getProperty('CC_ACCESS_TOKEN');
+  if (!at) at = refreshAccessToken_();
+  return at;
+}
+function refreshAccessToken_() {
+  const props = PropertiesService.getScriptProperties();
+  const clientId = props.getProperty('CC_CLIENT_ID');
+  const refreshToken = props.getProperty('CC_REFRESH_TOKEN');
+  if (!clientId || !refreshToken) throw new Error('Missing script properties: CC_CLIENT_ID and/or CC_REFRESH_TOKEN');
+
+
+  const payload = { grant_type: 'refresh_token', refresh_token: refreshToken, client_id: clientId };
+  const resp = UrlFetchApp.fetch(CC_TOKEN, {
+    method: 'post',
+    muteHttpExceptions: true,
+    headers: { 'Accept': 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
+    payload: toFormUrlencoded_(payload)
+  });
+  const code = resp.getResponseCode();
+  const body = parseJsonSafe_(resp.getContentText());
+  if (code >= 200 && code < 300 && body && body.access_token) {
+    props.setProperty('CC_ACCESS_TOKEN', body.access_token);
+    if (body.refresh_token) props.setProperty('CC_REFRESH_TOKEN', body.refresh_token);
+    return body.access_token;
+  }
+  throw new Error(`Token refresh failed (${code}): ${resp.getContentText()}`);
+}
+
+
+/** ---------- CC fetch + pagination helpers ---------- **/
+function ccFetch_(path, method, jsonBody) {
+  const props = PropertiesService.getScriptProperties();
+  const tryOnce = (token) => {
+    const resp = UrlFetchApp.fetch(resolvePath_(path), {
+      method: (method || 'get').toUpperCase(),
+      muteHttpExceptions: true,
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      payload: jsonBody ? JSON.stringify(jsonBody) : undefined
+    });
+    const code = resp.getResponseCode();
+    if (code === 204) return {};
+    const body = parseJsonSafe_(resp.getContentText()) || {};
+    if (code >= 200 && code < 300) return body;
+    if (code === 429) { Utilities.sleep(2000); return tryOnce(token); }
+    if (code === 401) { const newToken = refreshAccessToken_(); return tryOnce(newToken); }
+    throw new Error(`CC ${path} ${method} failed (${code}): ${resp.getContentText()}`);
+  };
+  const token = props.getProperty('CC_ACCESS_TOKEN') || refreshAccessToken_();
+  return tryOnce(token);
+}
+function resolvePath_(p) {
+  if (!p) return CC_BASE;
+  if (p.startsWith('http')) {
+    const u = p.replace(/^https?:\/\/[^/]+/i, '');
+    return CC_BASE + (u.startsWith('/v3') ? u.replace(/^\/v3/, '') : u);
+  }
+  return p.startsWith('/') ? (CC_BASE + p) : (CC_BASE + '/' + p);
+}
+
+
+/** ---------- Lists / Tags / Sheet helpers (robust tag pagination) ---------- **/
+function getOrCacheListId_(listName) {
+  const key = 'LIST_ID::' + listName;
+  const props = PropertiesService.getScriptProperties();
+  const cached = props.getProperty(key);
+  if (cached) return cached;
+  const lists = ccFetch_('/contact_lists?limit=500', 'get', null);
+  const arr = Array.isArray(lists) ? lists : (lists.lists || lists || []);
+  const found = arr.find(l => (l.name || '').trim().toLowerCase() === listName.trim().toLowerCase());
+  if (!found || !found.list_id) throw new Error(`Could not find list named "${listName}".`);
+  props.setProperty(key, found.list_id);
+  return found.list_id;
+}
+
+
+// Case-insensitive tag split + de-dupe
+function splitTags_(arr){
+  const seen = new Set(); const out = [];
+  arr.forEach(t => {
+    if (!t) return;
+    String(t).split(/[;,]/).forEach(p => {
+      const s = p.trim(); if (!s) return;
+      const key = s.toLowerCase();
+      if (!seen.has(key)) { seen.add(key); out.push(s); }
+    });
+  });
+  return out;
+}
+
+
+// Fetch ALL tags across pages
+function fetchAllTags_() {
+  const all = [];
+  let path = '/contact_tags?limit=500';
+  for (let guard = 0; guard < 50 && path; guard++) {
+    const res = ccFetch_(path, 'get', null);
+    const arr = Array.isArray(res) ? res : (res.tags || []);
+    if (Array.isArray(arr) && arr.length) all.push.apply(all, arr);
+
+
+    let nextHref = null;
+    const links = res && (res._links || res.links);
+    if (links && links.next) nextHref = links.next.href || links.next;
+    if (!nextHref && res && res.next_link) nextHref = res.next_link;
+
+
+    if (nextHref) path = nextHref;
+    else if (Array.isArray(arr) && arr.length === 500) {
+      const m = /[?&]offset=(\d+)/i.exec(path);
+      const offset = m ? Number(m[1]) + 500 : 500;
+      path = '/contact_tags?limit=500&offset=' + offset;
+    } else {
+      path = null;
+    }
+  }
+  return all;
+}
+
+
+// Ensure tag names exist; return { name -> tag_id } (409-safe + pagination-safe)
+function ensureTagsAndMapIds_(names) {
+  const map = {};
+  if (!names.length) return map;
+
+
+  const uniq = []; const seen = new Set();
+  names.forEach(n => {
+    const s = String(n || '').trim();
+    if (!s) return;
+    const k = s.toLowerCase();
+    if (!seen.has(k)) { seen.add(k); uniq.push(s); }
+  });
+
+
+  let existing = fetchAllTags_();
+  const byLower = {};
+  existing.forEach(t => { if (t && t.name && t.tag_id) byLower[String(t.name).toLowerCase()] = t.tag_id; });
+
+
+  // Map pre-existing
+  uniq.forEach(n => { const id = byLower[n.toLowerCase()]; if (id) map[n] = id; });
+
+
+  // Create missing
+  const toCreate = uniq.filter(n => !byLower[n.toLowerCase()]);
+  for (const n of toCreate) {
+    try {
+      const created = ccFetch_('/contact_tags', 'post', { name: n });
+      if (created && created.tag_id) { map[n] = created.tag_id; byLower[n.toLowerCase()] = created.tag_id; }
+    } catch (e) {
+      if (/409/.test(String(e))) {
+        existing = fetchAllTags_();
+        let foundId = null;
+        for (const t of existing) {
+          if (t && t.name && t.tag_id && String(t.name).toLowerCase() === n.toLowerCase()) { foundId = t.tag_id; break; }
+        }
+        if (foundId) { map[n] = foundId; byLower[n.toLowerCase()] = foundId; }
+        else { throw new Error('Tag exists but id not found for name: ' + n); }
+      } else { throw e; }
+    }
+  }
+  return map;
+}
+
+
+function readSheet_(name) {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(name);
+  if (!sh) throw new Error(`Sheet "${name}" not found`);
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return { rows: [], headerMap: {} };
+  const headers = values[0].map(h => String(h).trim());
+  const headerMap = {}; headers.forEach((h, i) => headerMap[h] = i);
+  ['Email','First Name','Last Name','Top-Level Tag','Sub-Category Tag','Phone']
+    .forEach(c => { if (!(c in headerMap)) throw new Error(`Missing required column: ${c}`); });
+  return { rows: values.slice(1), headerMap };
+}
+
+
+/** ---------- Small helpers ---------- **/
+function val_(row, idx) { return (idx == null || idx < 0) ? '' : String(row[idx] ?? '').trim(); }
+function parseJsonSafe_(t){try{return JSON.parse(t);}catch(e){return null;}}
+function stringifyErr_(e){if(e&&e.stack)return e.stack; if(e&&e.message)return e.message; return String(e);}
+function escapeHtml_(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function toFormUrlencoded_(obj){return Object.keys(obj).map(k=>encodeURIComponent(k)+'='+encodeURIComponent(obj[k]==null?'':String(obj[k]))).join('&');}
+function Backoff_(){this.delay=0;} Backoff_.prototype.maybeWait=function(e){ if(/429/.test(String(e))){ this.delay=Math.min(this.delay+500,4000); Utilities.sleep(this.delay); } };
+
+
+// Clean a name: keep letters/spaces/hyphens/apostrophes; trim/cap; drop emails and junk.
+// Return null if empty/invalid after cleaning (so we omit the field).
+function cleanNameOrNull_(s) {
+  let t = String(s || '').trim();
+  if (!t) return null;
+
+
+  // Drop obvious emails
+  if (/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(t)) return null;
+
+
+  // Normalize, remove control chars
+  t = t.normalize ? t.normalize('NFKC') : t;
+  t = t.replace(/[\u0000-\u001F]/g, '');
+
+
+  // Keep letters (incl. accents), spaces, hyphens, apostrophes
+  t = t.replace(/[^A-Za-zÀ-ÖØ-öø-ÿ'’ -]/g, ' ');
+
+
+  // Collapse/trim; strip edge punctuation
+  t = t.replace(/\s{2,}/g, ' ').trim().replace(/^[-'’\s]+|[-'’\s]+$/g, '');
+
+
+  if (!t) return null;
+  if (t.length > 60) t = t.slice(0, 60);
+  return t || null;
+}
+
+
+

@@ -1,0 +1,556 @@
+function buildMasterStructured() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const MASTER_NAME = "Master (All Tabs)";
+  const HEADER_SCAN_ROWS = 12;
+
+
+  // Final columns (exact order)
+  const MASTER_HEADER = [
+    "First Name","Last Name","Email","Phone",
+    "Top-Level Tag","Sub-Category Tag","Channel","Event Date","Notes"
+  ];
+
+
+  // Aliases to find columns on each sheet
+  const COL_ALIASES = {
+    date:  ["date","date and time","datetime","timestamp","created","created at"],
+    first: ["first name","firstname","first","given name","givenname","name first"],
+    last:  ["last name","lastname","last","surname","family name","familyname","name last"],
+    full:  ["name","full name"],
+    email: ["email address","email","e-mail","emailaddress"],
+    phone: ["phone","phone number","phone #","telephone","tel","mobile","cell","cell phone","cellphone"],
+    camp:  ["campaign","source campaign","campaign name","source","campaign/source","tag","list","workshop","topic"]
+  };
+
+
+  // --- Helpers
+  const norm  = v => String(v || "").trim();
+  const lnorm = v => norm(v).toLowerCase();
+  const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+  const PHONE_RE = /(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4})/;
+  const BAD_PATTERNS = ["test","do not call","sample text"];
+
+
+  // Header-ish / placeholder tokens to ignore anywhere in a row
+  const isHeaderish = s =>
+    /^\s*(first\s*name(\s*last\s*name)?|last\s*name|full\s*name|name|email(\s*address)?|phone(\s*number| #)?|date(\s*and\s*time)?|timestamp|campaign|tag|topic|list|source)\s*$/i
+      .test(s || "");
+
+
+  const isCampaignPlaceholder = s =>
+    /^\s*(campaign|tag|topic|list|source)\s*$/i.test(s || "");
+
+
+  function cleanPhone(s) {
+    const digits = String(s||"").replace(/\D+/g,"");
+    if (!digits) return "";
+    if (digits.length === 10) return "+1" + digits;
+    if (digits.length === 11 && digits.startsWith("1")) return "+" + digits;
+    return "+" + digits; // best effort for intl
+  }
+
+
+  function looksLikeFullName(s) {
+    const t = lnorm(s).replace(/\s+/g," ").trim();
+    if (!t) return false;
+    if (EMAIL_RE.test(t)) return false;
+    if (PHONE_RE.test(t)) return false;
+    if (isHeaderish(t)) return false;
+    const parts = t.split(" ");
+    if (parts.length < 2 || parts.length > 4) return false;
+    return parts.every(p => /^[a-z'’-]+$/.test(p));
+  }
+
+
+  function splitName(s) {
+    const parts = norm(s).replace(/\s+/g," ").trim().split(" ");
+    if (parts.length === 1) return { first: parts[0], last: "" };
+    if (parts.length === 2) return { first: parts[0], last: parts[1] };
+    return { first: parts[0], last: parts.slice(1).join(" ") };
+  }
+
+
+  function findHeaderRow(values) {
+    const allAliases = [].concat(
+      COL_ALIASES.date, COL_ALIASES.first, COL_ALIASES.last, COL_ALIASES.full,
+      COL_ALIASES.email, COL_ALIASES.phone, COL_ALIASES.camp
+    );
+    for (let r = 0; r < values.length; r++) {
+      const row = values[r].map(lnorm);
+      const hits = allAliases.filter(a => row.includes(a)).length;
+      if (hits >= 2) return r;
+    }
+    return -1;
+  }
+
+
+  function indexByAliases(headerRow, aliasList) {
+    const lower = headerRow.map(lnorm);
+    for (let i = 0; i < lower.length; i++) {
+      if (aliasList.includes(lower[i])) return i;
+    }
+    return undefined;
+  }
+
+
+  // red-ish background detector
+  const isRedish = (hex) => {
+    if (!hex) return false;
+    const s = String(hex).toLowerCase();
+    if (s === "red") return true;
+    const m = /^#?([0-9a-f]{6})$/i.exec(s);
+    if (!m) return false;
+    const h = m[1];
+    const r = parseInt(h.slice(0,2),16), g = parseInt(h.slice(2,4),16), b = parseInt(h.slice(4,6),16);
+    return (r >= 170) && (r > g + 30) && (r > b + 30);
+  };
+
+
+  // Channel detection
+  const CHANNELS = [
+    { re: /\b(?:fb|facebook)\b/i, label: "FB" },
+    { re: /\beventbrite\b/i, label: "Eventbrite" },
+    { re: /\ballevents?\b/i, label: "AllEvents" },
+    { re: /\bemail\b/i, label: "Email" },
+    { re: /\bmessenger\b/i, label: "Messenger" },
+    { re: /\b(?:form|contact[_\s-]*form)\b/i, label: "Form" },
+    { re: /\bwalk[-\s]*in|walkin\b/i, label: "Walk-in" },
+    { re: /\btext\b/i, label: "Text" },
+    { re: /\bgroup\b/i, label: "Group" },
+  ];
+  function detectChannels(raw) {
+    const found = [];
+    CHANNELS.forEach(c => { if (c.re.test(raw)) found.push(c.label); });
+    return found.join(", ");
+  }
+
+
+  // Event Date extraction (keeps raw token; not strict ISO)
+  function extractEventDate(raw) {
+    const s = String(raw||"");
+    // match things like 24.08, 24/08, 9/14, 9.9.2025, 20-10-28, 2025-09-10
+    const m = s.match(/\b(\d{1,4}(?:[./-]\d{1,2}){1,2})\b/);
+    return m ? m[1] : "";
+  }
+
+
+  // ==========================
+  // Top-level & sub-category mapping (FULL)
+  // ==========================
+  const SUB_FAMILIES = [
+    // 1. DIANETICS WORKSHOPS
+    { family: "Columbia Dn Seminar", top: "Dianetics Workshops",
+      re: /\bcolumbia\s*(?:dn|dianetics)\s*(?:seminar|wkshp|workshop)\b/i },
+    { family: "Dianetics Workshop", top: "Dianetics Workshops",
+      re: /\bdianetics\s*workshop\b|(?:\bdn\b.*\bworkshop\b)/i },
+    { family: "DN Download", top: "Dianetics Workshops",
+      re: /\bdn\s*download\b/i },
+    { family: "Dianetics Download Lead", top: "Dianetics Workshops",
+      re: /dianetics\s*download\s*lead/i },
+
+
+    // 2. SELF-CONFIDENCE
+    { family: "Self-Confidence", top: "Self-Confidence",
+      re: /\bself[-\s]*confidence\b(?!.*(business|entrepreneur))/i },
+    { family: "Self-Confidence (dated/email variants)", top: "Self-Confidence",
+      re: /(email[, ]*)?\b\d{2}[-./]\d{2}\b.*self[-\s]*confidence|\bself[-\s]*confidence\s*\d{2}[-./]\d{2}\b/i },
+    { family: "Self-Confidence Consults", top: "Self-Confidence",
+      re: /self[-\s]*confidence\s*consults?|\bconsults?\b.*self[-\s]*confidence/i },
+    { family: "Low Self-Esteem", top: "Self-Confidence",
+      re: /low\s*self[-\s]*esteem/i },
+    { family: "How to Achieve Self-Confidence (workshop)", top: "Self-Confidence",
+      re: /how\s*to\s*achieve\s*self[-\s]*confidence(\s*work(shop)?)?/i },
+    { family: "Self-Confidence Workshop (dated legacy)", top: "Self-Confidence",
+      re: /\b(20|21)-\d{2}-\d{2}\b.*self[-\s]*confidence.*(webinar|workshop)?/i },
+
+
+    // 3. RELATIONSHIPS
+    { family: "Relationships", top: "Relationships",
+      re: /\brelationships?\b(?!.*(anxiety|business|entrepreneur))/i },
+    { family: "Relationships (FB/Eventbrite/Email variants)", top: "Relationships",
+      re: /\brelationships?\b.*\b(fb|facebook|eventbrite|email)\b/i },
+    { family: "Relationships Workshop", top: "Relationships",
+      re: /\brelationships?\s*workshop\b/i },
+    { family: "Creating Relationships You Deserve", top: "Relationships",
+      re: /creating\s*relationships?\s*you\s*deserve/i },
+    { family: "Email Relationships (dated)", top: "Relationships",
+      re: /\bemail\b.*\brelationships?\b.*\b\d{2}\.\d{2}\b/i },
+
+
+    // 4. ANXIETY / EMOTIONAL TRIGGERS
+    { family: "Anxiety", top: "Anxiety / Emotional Triggers",
+      re: /\banxiety\b(?!.*(business|entrepreneur))/i },
+    { family: "Break Anxiety (dated/FB)", top: "Anxiety / Emotional Triggers",
+      re: /break(ing)?\s*anxiety(\s*&\s*fear\s*of\s*failure)?(\s*\d{2}[-./]\d{2}|\s*\bfb\b)?/i },
+    { family: "Anxiety and Fear of Failure", top: "Anxiety / Emotional Triggers",
+      re: /anxiety\s*(and|&)\s*fear\s*of\s*failure/i },
+    { family: "Overcoming Unwanted Emotions, Anxiety & Stress", top: "Anxiety / Emotional Triggers",
+      re: /overcoming\s*unwanted\s*emotions.*anxiety\s*&\s*stress|overcoming\s*emotions/i },
+    { family: "Eliminate Emotional Triggers", top: "Anxiety / Emotional Triggers",
+      re: /eliminat(e|ing)\s*(emotional\s*)?triggers|elim\s*emot\s*trig/i },
+    { family: "Anxiety Consults", top: "Anxiety / Emotional Triggers",
+      re: /anxiety\s*consults?|anxiety\s*conult/i },
+    { family: "Related Emotional Issues", top: "Anxiety / Emotional Triggers",
+      re: /self[-\s]*destructive|trouble\s*connecting|shyness/i },
+
+
+    // 5. MOTIVATION
+    { family: "Motivated", top: "Motivation",
+      re: /\bmotivated?\b/i },
+    { family: "How To Get Motivated WS", top: "Motivation",
+      re: /how\s*to\s*get\s*motivated\s*(ws|workshop)?/i },
+    { family: "Lack of Motivation", top: "Motivation",
+      re: /lack\s*of\s*motivation/i },
+
+
+    // 6. NEGATIVE EXPERIENCES / NEGATIVE THOUGHTS
+    { family: "Negative Experiences", top: "Negative Experiences / Negative Thoughts",
+      re: /\bneg(ative)?\s*experiences?\b/i },
+    { family: "Negative Thoughts & Emotions", top: "Negative Experiences / Negative Thoughts",
+      re: /negative\s*thoughts?\s*&\s*emotions?/i },
+    { family: "Negative Mindset", top: "Negative Experiences / Negative Thoughts",
+      re: /negative\s*mindset/i },
+
+
+    // 7. TOXIC PERSONALITIES / TRUST
+    { family: "Toxic Personalities", top: "Toxic Personalities / Trust",
+      re: /toxic\s*pers(?:on(?:al(?:it(?:y|ies)?)?)?)?/i },
+    { family: "Identify Toxic Personalities (Eventbrite variant)", top: "Toxic Personalities / Trust",
+      re: /identify\s*toxic\s*personalities/i },
+    { family: "Trust / Who You Can Trust", top: "Toxic Personalities / Trust",
+      re: /knowing\s*who\s*you\s*can\s*trust/i },
+
+
+    // 8. CREATING LIFE / LIFE YOU WANT
+    { family: "Creating the Life You Want", top: "Creating Life / Life You Want",
+      re: /creating\s*(the\s*)?life\s*you\s*want/i },
+    { family: "Life You Want", top: "Creating Life / Life You Want",
+      re: /\blife\s*you\s*want\b/i },
+    { family: "Creating Life (dated/FB/Email)", top: "Creating Life / Life You Want",
+      re: /creating\s*life.*(\bfb\b|\bemail\b|\b\d{2}[-./]\d{2}\b)/i },
+
+
+    // 9. BUSINESS & ENTREPRENEUR / GOALS / PRODUCTIVITY
+    // Expanded rule to catch "business and entre" with optional accelerator and channel/date tokens
+    { family: "Business & Entrepreneur Accelerator",
+      top: "Business & Entrepreneur / Goals / Productivity",
+      re: /(?:business|bus|biz)\s*(?:and|&)\s*(?:entrepreneur|entre|ent)(?:\s*(?:accelerator|acc))?(?=.*(?:eventbrite|fb|\b\d{2}[-./]\d{2}\b))?/i
+    },
+    { family: "Goals", top: "Business & Entrepreneur / Goals / Productivity",
+      re: /\bgoals?\b(?!\s*achievement)/i },
+    { family: "Setting & Achieving Your Goals", top: "Business & Entrepreneur / Goals / Productivity",
+      re: /setting\s*&\s*achieving\s*your\s*goals?|goals?\s*achievement/i },
+    { family: "Time & Money", top: "Business & Entrepreneur / Goals / Productivity",
+      re: /time\s*&\s*money|time\s*and\s*money/i },
+    { family: "Organizational Skills", top: "Business & Entrepreneur / Goals / Productivity",
+      re: /organizational\s*skills/i },
+    { family: "Leadership Skills", top: "Business & Entrepreneur / Goals / Productivity",
+      re: /leadership\s*skills/i },
+    { family: "Time Management", top: "Business & Entrepreneur / Goals / Productivity",
+      re: /time\s*management/i },
+    { family: "Work-Life Balance", top: "Business & Entrepreneur / Goals / Productivity",
+      re: /work[-\s]*life\s*balance/i },
+    { family: "Taking Your Career to Next Level", top: "Business & Entrepreneur / Goals / Productivity",
+      re: /taking\s*your\s*career\s*to\s*(the\s*)?next\s*level/i },
+    { family: "Decision Making", top: "Business & Entrepreneur / Goals / Productivity",
+      re: /decision\s*making/i },
+
+
+    // 10. COMMUNICATION & CONNECTION
+    { family: "Instantly Connect", top: "Communication & Connection",
+      re: /instantly\s*connect/i },
+    { family: "Instantly Connect (Messenger)", top: "Communication & Connection",
+      re: /instantly\s*connect.*\b(messenger|fb)\b/i },
+    { family: "World-Class Communication Skills", top: "Communication & Connection",
+      re: /world[-\s]*class\s*communication\s*skills/i },
+    { family: "Communication Skills", top: "Communication & Connection",
+      re: /\bcommunication\s*skills\b/i },
+    { family: "Success Through Communication", top: "Communication & Connection",
+      re: /success\s*through\s*communication/i },
+    { family: "People Skills", top: "Communication & Connection",
+      re: /people\s*skills/i },
+    { family: "Get Your Point Across", top: "Communication & Connection",
+      re: /get\s*your\s*point\s*across/i },
+
+
+    // 11. MISCELLANEOUS / OTHER WORKSHOPS
+    { family: "Burford Workshop (Shell Knob/Cassville)", top: "Miscellaneous / Other Workshops",
+      re: /burford|shell\s*knob|cassville/i },
+    { family: "Gun Show (lead source)", top: "Miscellaneous / Other Workshops",
+      re: /\bgun\s*show\b/i },
+    { family: "Lead Sources / Other", top: "Miscellaneous / Other Workshops",
+      re: /orig\s*came\s*in\s*through\s*email|fb\s*group\s*joins|contact[_\s-]*forms?|free\s*session\s*leads?|just\s*reach\s*out|reach\s*out/i },
+    { family: "Creating Life You Deserve (possible overlap)", top: "Miscellaneous / Other Workshops",
+      re: /creating\s*life\s*you\s*deserve/i },
+  ];
+
+
+  function classifyTopAndSub(campaignRaw) {
+    const raw = String(campaignRaw || "").trim();
+    for (const rule of SUB_FAMILIES) {
+      if (rule.re.test(raw)) return { top: rule.top, sub: rule.family };
+    }
+    // If it's clearly a placeholder like "Campaign"/"Tag", don't keep it as sub
+    if (isCampaignPlaceholder(raw)) {
+      return { top: "Miscellaneous / Other Workshops", sub: "Uncategorized" };
+    }
+    // Otherwise keep original as requested
+    if (/dianetics|dn\b/i.test(raw)) return { top: "Dianetics Workshops", sub: raw || "Uncategorized" };
+    return { top: "Miscellaneous / Other Workshops", sub: raw || "Uncategorized" };
+  }
+
+
+  // --- Build & logging
+  const rowsOut = [];
+  const seenByTop = new Set(); // keys like: `${top}|email:...` or `${top}|phone:...`
+  const sheets = ss.getSheets().filter(sh => sh.getName() !== MASTER_NAME);
+
+
+  console.log(`Total tabs (excluding "${MASTER_NAME}"): ${sheets.length}`);
+
+
+  let processedTabs = 0;
+  let totalScannedRows = 0;
+  let totalSkippedRed = 0;
+  let totalWritten = 0;
+  let totalDuplicates = 0;
+
+
+  sheets.forEach((sh, idx) => {
+    const tabName = sh.getName();
+    console.log(`\n[${idx + 1}/${sheets.length}] Processing tab: "${tabName}"`);
+
+
+    const lastRow = sh.getLastRow();
+    const lastCol = sh.getLastColumn();
+    if (lastRow < 1 || lastCol < 1) {
+      console.log(`  - Skipping: empty sheet`);
+      return;
+    }
+
+
+    const scanRows = Math.min(HEADER_SCAN_ROWS, lastRow);
+    const previewVals = sh.getRange(1,1,scanRows,lastCol).getValues();
+    const headerRowIdx = findHeaderRow(previewVals);
+    if (headerRowIdx === -1) {
+      console.log(`  - Skipping: header row not found within first ${HEADER_SCAN_ROWS} rows`);
+      return;
+    } else {
+      console.log(`  - Header found at sheet row ${headerRowIdx + 1}`);
+    }
+
+
+    processedTabs++;
+
+
+    const numRows = lastRow - headerRowIdx;
+    const range = sh.getRange(headerRowIdx + 1, 1, numRows, lastCol);
+    const values = range.getValues();
+    const bgs    = range.getBackgrounds();
+
+
+    let writtenThisTab = 0;
+    let redThisTab = 0;
+    let scannedThisTab = 0;
+
+
+    // new: per-tab top-level counts & duplicate counts
+    const topCounts = Object.create(null);
+    const dupCounts = Object.create(null);
+
+
+    const header = previewVals[headerRowIdx];
+    const iDate  = indexByAliases(header, COL_ALIASES.date);
+    const iFirst = indexByAliases(header, COL_ALIASES.first);
+    const iLast  = indexByAliases(header, COL_ALIASES.last);
+    const iFull  = indexByAliases(header, COL_ALIASES.full);
+    const iEmail = indexByAliases(header, COL_ALIASES.email);
+    const iPhone = indexByAliases(header, COL_ALIASES.phone);
+    const iCamp  = indexByAliases(header, COL_ALIASES.camp);
+
+
+    for (let r = 0; r < values.length; r++) {
+      const row = values[r];
+      const bgRow = bgs[r];
+
+
+      // Track scanned rows (count all rows under header)
+      scannedThisTab++;
+
+
+      if (row.every(c => String(c).trim() === "")) continue;
+
+
+      if (bgRow.some(isRedish)) {
+        redThisTab++;
+        console.log(`  - Skipped RED row at sheet row ${headerRowIdx + 1 + r} in "${tabName}"`);
+        continue;
+      }
+
+
+      // Pull declared cells
+      let date  = (iDate  !== undefined) ? row[iDate]  : "";
+      let first = (iFirst !== undefined) ? norm(row[iFirst]) : "";
+      let last  = (iLast  !== undefined) ? norm(row[iLast])  : "";
+      let full  = (iFull  !== undefined) ? norm(row[iFull])  : "";
+      let email = (iEmail !== undefined) ? norm(row[iEmail]) : "";
+      let phone = (iPhone !== undefined) ? norm(row[iPhone]) : "";
+      let camp  = (iCamp  !== undefined) ? norm(row[iCamp])  : tabName;
+
+
+      // Row-wide rescue scan — ignore header-ish tokens first
+      const texts = row.map(norm).filter(t => t && !isHeaderish(t));
+
+
+      // Email: enforce valid format
+      if (!email) {
+        const eHit = texts.find(t => EMAIL_RE.test(t));
+        if (eHit) { const m = eHit.match(EMAIL_RE); if (m) email = m[0]; }
+      } else {
+        const m = email.match(EMAIL_RE);
+        email = m ? m[0] : ""; // invalid email becomes empty
+      }
+
+
+      // Phone: enforce valid format; stash invalid phone text to Notes
+      let phoneNote = "";
+      if (!phone) {
+        const pHit = texts.find(t => PHONE_RE.test(t));
+        if (pHit) { const m = pHit.match(PHONE_RE); if (m) phone = cleanPhone(m[0]); }
+      } else {
+        const m = phone.match(PHONE_RE);
+        if (m) {
+          phone = cleanPhone(m[0]);
+        } else {
+          phoneNote = phone;  // keep original text as a note
+          phone = "";         // invalid phone becomes empty
+        }
+      }
+
+
+      if (!first && !last) {
+        if (full) {
+          const n = splitName(full); first = n.first; last = n.last;
+        } else {
+          const nameLike = texts.find(looksLikeFullName);
+          if (nameLike) { const n = splitName(nameLike); first = n.first; last = n.last; }
+        }
+      }
+
+
+      // Clean campaign of accidental email/phone and placeholders
+      if (camp) {
+        camp = camp.replace(EMAIL_RE,"").replace(PHONE_RE,"").replace(/\s{2,}/g," ").trim();
+        if (!camp || isCampaignPlaceholder(camp)) camp = tabName;
+      }
+
+
+      // --- Placeholder scrub on fields (includes phone)
+      const isPlaceholder = s =>
+        /^\s*(first\s*name(\s*last\s*name)?|last\s*name|full\s*name|name|email(\s*address)?|phone(\s*number| #)?|date(\s*and\s*time)?)\s*$/i
+          .test(s || "");
+      if (isPlaceholder(first)) first = "";
+      if (isPlaceholder(last))  last  = "";
+      if (isPlaceholder(full))  full  = "";
+      if (isPlaceholder(email)) email = "";
+      if (isPlaceholder(phone)) phone = "";
+
+
+      // Filters
+      const bad = BAD_PATTERNS.some(p =>
+        lnorm(first).includes(p) || lnorm(last).includes(p) || lnorm(email).includes(p)
+      );
+      if (bad) continue;
+      if (!email && !phone) continue;
+
+
+      // Tags, Channel, Date
+      const ch   = detectChannels(camp);
+      const evDt = extractEventDate(camp);
+      const { top, sub } = classifyTopAndSub(camp);
+
+
+      // record top-level "deciding on" before dedupe
+      topCounts[top] = (topCounts[top] || 0) + 1;
+
+
+      // Final name fields (ensure split)
+      if (!first && !last && full) {
+        const n = splitName(full);
+        first = n.first; last = n.last;
+      }
+
+
+      // --- De-dup per Top-Level Tag by email/phone
+      const emailKey = email ? `${top}|email:${email.toLowerCase()}` : null;
+      const phoneKey = phone ? `${top}|phone:${phone}` : null;
+
+
+      const duplicate =
+        (emailKey && seenByTop.has(emailKey)) ||
+        (phoneKey && seenByTop.has(phoneKey));
+
+
+      if (duplicate) {
+        dupCounts[top] = (dupCounts[top] || 0) + 1;
+        totalDuplicates++;
+        continue; // skip repeat within the same Top-Level Tag
+      }
+
+
+      if (emailKey) seenByTop.add(emailKey);
+      if (phoneKey) seenByTop.add(phoneKey);
+
+
+      // Notes (carry phone cell note if present)
+      const notes = phoneNote ? `Phone cell note: ${phoneNote}` : "";
+
+
+      rowsOut.push([first, last, email, phone, top, sub, ch, evDt, notes]);
+      writtenThisTab++;
+    }
+
+
+    totalScannedRows += scannedThisTab;
+    totalSkippedRed  += redThisTab;
+    totalWritten     += writtenThisTab;
+
+
+    // Per-tab breakdown logs
+    console.log(`  - Top-Levels chosen in "${tabName}": ${JSON.stringify(topCounts)}`);
+    console.log(`  - Duplicates skipped by Top-Level in "${tabName}": ${JSON.stringify(dupCounts)}`);
+    console.log(`  - Tab summary: scanned ${scannedThisTab} data rows, skipped RED ${redThisTab}, wrote ${writtenThisTab}`);
+  });
+
+
+  // --- Write output (declare master ONCE here)
+  let master = ss.getSheetByName(MASTER_NAME);
+  if (!master) {
+    console.log(`Master sheet "${MASTER_NAME}" not found — creating new sheet.`);
+    master = ss.insertSheet(MASTER_NAME);
+  } else {
+    console.log(`Master sheet "${MASTER_NAME}" found — reusing and clearing contents.`);
+  }
+
+
+  master.clearContents();
+  master.getRange(1,1,1,MASTER_HEADER.length).setValues([MASTER_HEADER]);
+  if (rowsOut.length > 0) {
+    master.getRange(2,1,rowsOut.length,MASTER_HEADER.length).setValues(rowsOut);
+  }
+  master.setFrozenRows(1);
+  for (let c = 1; c <= MASTER_HEADER.length; c++) master.autoResizeColumn(c);
+
+
+  console.log(`\n=== RUN SUMMARY ===
+  Tabs discovered (excluding Master): ${sheets.length}
+  Tabs processed (with headers found): ${processedTabs}
+  Data rows scanned (under headers): ${totalScannedRows}
+  RED rows skipped: ${totalSkippedRed}
+  Duplicates skipped (all Top-Levels): ${totalDuplicates}
+  Rows written to Master: ${totalWritten}
+  ===================`);
+}
+
+
+
